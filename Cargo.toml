@@ -7,3 +7,4 @@ description = "Convert PostgreSQL dump files to SQLite (minimal CLI first step)"
 license = "MIT"
 
 [dependencies]
+clap = { version = "4.3", features = ["derive"] }

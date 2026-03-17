@@ -1,33 +1,32 @@
-use std::env;
-use std::path::Path;
+use std::path::PathBuf;
 use std::process;
 
-fn print_usage(program: &str) {
-    eprintln!("Usage: {} <dump-file>", program);
+use clap::Parser;
+
+/// pg2lite — convert PostgreSQL dump files to SQLite
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Input PostgreSQL dump file
+    input: PathBuf,
+
+    /// Optional output SQLite file. If omitted, set by replacing input extension with `.sqlite`.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 }
 
 fn main() {
-    let mut args = env::args();
-    let program = args.next().unwrap_or_else(|| "pg2lite".to_string());
+    let args = Args::parse();
 
-    let input = match args.next() {
-        Some(v) => v,
-        None => {
-            print_usage(&program);
-            process::exit(1);
-        }
-    };
-
-    let in_path = Path::new(&input);
-
-    if !in_path.exists() {
-        eprintln!("error: input file '{}' does not exist", in_path.display());
+    if !args.input.exists() {
+        eprintln!("error: input file '{}' does not exist", args.input.display());
         process::exit(2);
     }
 
-    // Compute output filename by replacing (or adding) the extension with `.sqlite`.
-    let out_path = in_path.with_extension("sqlite");
+    let out_path = match args.output {
+        Some(p) => p,
+        None => args.input.with_extension("sqlite"),
+    };
 
-    // Print the computed output path to stdout so callers can capture it.
     println!("{}", out_path.display());
 }
