@@ -93,8 +93,40 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
 
     let tx = conn.transaction()?;
 
-    // track tables that should be AUTOINCREMENT primary key: (table_name, pk_column)
-    let mut autoinc_tables: Vec<(String, String)> = Vec::new();
+    // track tables that should be AUTOINCREMENT primary key: (table_name, pk_column, optional_sequence_last_value)
+    let mut autoinc_tables: Vec<(String, String, Option<i64>)> = Vec::new();
+
+    // First pass: collect sequence definitions, setval calls and OWNED BY mappings.
+    use std::collections::HashMap;
+    struct SeqInfo { start: Option<i64>, last_value: Option<i64>, owned: Option<(String, String)> }
+    let mut sequences: HashMap<String, SeqInfo> = HashMap::new();
+    let re_create_seq = Regex::new(r"(?i)CREATE\s+SEQUENCE\s+('?)(?P<name>[^'\s;]+)\1(?:.*?START\s+WITH\s+(?P<start>\d+))?").unwrap();
+    let re_setval = Regex::new(r"(?i)setval\s*\(\s*'(?P<name>[^']+)'\s*,\s*(?P<val>\d+)").unwrap();
+    let re_alter_owned = Regex::new(r"(?i)ALTER\s+SEQUENCE\s+('?)(?P<name>[^'\s]+)\1\s+OWNED\s+BY\s+('?)(?P<table>[^'.\s]+)\3\.(?:"?(?P<col>[^'\)\s]+)"?)").unwrap();
+    let re_nextval_name = Regex::new(r"(?i)nextval\(\s*'(?P<name>[^']+)'::regclass\s*\)").unwrap();
+    for seg in &segments {
+        if let Segment::Stmt(s) = seg {
+            // CREATE SEQUENCE
+            for cap in re_create_seq.captures_iter(s) {
+                let name = cap.name("name").unwrap().as_str().to_string();
+                let start = cap.name("start").and_then(|m| m.as_str().parse().ok());
+                sequences.entry(name).or_insert(SeqInfo { start, last_value: None, owned: None });
+            }
+            // setval calls
+            for cap in re_setval.captures_iter(s) {
+                let name = cap.name("name").unwrap().as_str().to_string();
+                let val = cap.name("val").and_then(|m| m.as_str().parse().ok());
+                sequences.entry(name.clone()).or_insert(SeqInfo { start: None, last_value: val, owned: None }).last_value = val;
+            }
+            // ALTER SEQUENCE ... OWNED BY
+            for cap in re_alter_owned.captures_iter(s) {
+                let name = cap.name("name").unwrap().as_str().to_string();
+                let table = cap.name("table").unwrap().as_str().to_string();
+                let col = cap.name("col").unwrap().as_str().to_string();
+                sequences.entry(name.clone()).or_insert(SeqInfo { start: None, last_value: None, owned: Some((table.clone(), col.clone())) }).owned = Some((table, col));
+            }
+        }
+    }
 
     for seg in segments {
         match seg {
@@ -114,7 +146,7 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                                     // translate CreateTable into a SQLite-compatible DDL
                                     let tbl_name = name.to_string();
                                     // collect column info first so we can apply table-level constraints
-                                    struct ColInfo { name: String, typ: String, not_null: bool, default_nextval: bool, is_primary: bool }
+                                    struct ColInfo { name: String, typ: String, not_null: bool, default_nextval: bool, is_primary: bool, seq_name: Option<String> }
                                     let mut cols_info: Vec<ColInfo> = Vec::new();
                                     for col in columns.iter() {
                                         let mut typ = col.data_type.to_string();
@@ -126,12 +158,17 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                                         let mut not_null = false;
                                         let mut default_nextval = false;
                                         let mut is_primary = false;
+                                        let mut seq_name: Option<String> = None;
                                         for opt in col.options.iter() {
                                             match &opt.option {
                                                 ColumnOption::NotNull => not_null = true,
                                                 ColumnOption::Default(expr) => {
-                                                    let txt = expr.to_string().to_lowercase();
-                                                    if txt.contains("nextval") {
+                                                    let txt = expr.to_string();
+                                                    // try to extract sequence name from nextval('seq'::regclass)
+                                                    if let Some(cap) = re_nextval_name.captures(&txt) {
+                                                        default_nextval = true;
+                                                        seq_name = Some(cap.name("name").unwrap().as_str().to_string());
+                                                    } else if txt.to_lowercase().contains("nextval") {
                                                         default_nextval = true;
                                                     }
                                                 }
@@ -141,7 +178,7 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                                                 _ => {}
                                             }
                                         }
-                                        cols_info.push(ColInfo { name: col.name.to_string(), typ, not_null, default_nextval, is_primary });
+                                        cols_info.push(ColInfo { name: col.name.to_string(), typ, not_null, default_nextval, is_primary, seq_name });
                                     }
 
                                     // apply table-level primary key constraints
@@ -166,9 +203,27 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                                         // If single-column primary key and either declared SERIAL/DEFAULT nextval or type INTEGER,
                                         // make it INTEGER PRIMARY KEY AUTOINCREMENT for SQLite.
                                         if !composite_pk && ci.is_primary && (ci.default_nextval || ci.typ.to_uppercase() == "INTEGER") {
+                                            // determine sequence last value if available
+                                            let mut seq_last: Option<i64> = None;
+                                            if let Some(seq) = &ci.seq_name {
+                                                if let Some(si) = sequences.get(seq) {
+                                                    seq_last = si.last_value.or(si.start);
+                                                }
+                                            }
+                                            // also check sequences map for an owned sequence matching this table.col
+                                            if seq_last.is_none() {
+                                                for (sname, si) in sequences.iter() {
+                                                    if let Some((ref t, ref c)) = si.owned {
+                                                        if t == &tbl_name && c == &ci.name {
+                                                            seq_last = si.last_value.or(si.start);
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             let def = format!("{} INTEGER PRIMARY KEY AUTOINCREMENT", ci.name);
                                             col_defs.push(def);
-                                            autoinc_tables.push((tbl_name.clone(), ci.name.clone()));
+                                            autoinc_tables.push((tbl_name.clone(), ci.name.clone(), seq_last));
                                             continue;
                                         }
                                         let mut def = format!("{} {}", ci.name, ci.typ);
@@ -336,12 +391,16 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
     tx.commit()?;
 
     // After committing, update sqlite_sequence for AUTOINCREMENT tables so future inserts continue correctly.
-    for (table, pk) in autoinc_tables {
+    for (table, pk, seq_last) in autoinc_tables {
         let q = format!("SELECT MAX({}) FROM {}", pk, table);
         if let Ok(max_val) = conn.query_row(q.as_str(), [], |r| r.get::<_, Option<i64>>(0)) {
+            // compute final seq value as max(existing_max, declared seq_last)
+            let mut final_seq: Option<i64> = seq_last;
             if let Some(maxv) = max_val {
-                // try to write into sqlite_sequence; ignore errors if table isn't present
-                let _ = conn.execute("INSERT OR REPLACE INTO sqlite_sequence(name, seq) VALUES (?1, ?2)", params![table, maxv]);
+                final_seq = Some(final_seq.map_or(maxv, |s| std::cmp::max(s, maxv)));
+            }
+            if let Some(seqv) = final_seq {
+                let _ = conn.execute("INSERT OR REPLACE INTO sqlite_sequence(name, seq) VALUES (?1, ?2)", params![table, seqv]);
             }
         }
     }
