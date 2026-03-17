@@ -7,10 +7,31 @@ use sqlparser::parser::Parser;
 use rusqlite::params;
 use sqlparser::ast::{Statement, Value as SQLValue, Expr, TableConstraint, ColumnOption};
 use std::env;
+use csv::ReaderBuilder;
+use std::process::Command;
+use std::io::Read;
+use std::time::Instant;
 
 /// Convert a PostgreSQL dump file at `input` into a SQLite database at `output`.
+/// This wrapper preserves the original API and calls the verbose variant with `verbose=false`.
 pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let contents = fs::read_to_string(input)?;
+    convert_dump_to_sqlite_with_verbose(input, output, false)
+}
+
+/// Convert a PostgreSQL dump file at `input` into a SQLite database at `output`.
+/// When `verbose` is true, emit progress logs to stderr for COPY and batch INSERT operations.
+pub fn convert_dump_to_sqlite_with_verbose(input: &PathBuf, output: &PathBuf, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Support PostgreSQL custom-format dumps by detecting the magic header and
+    // using `pg_restore` to extract plain SQL. If not a custom-format dump,
+    // read the file contents directly.
+    let contents = if is_custom_pg_dump(input)? {
+        if verbose {
+            eprintln!("detected custom-format dump; attempting to run pg_restore...");
+        }
+        run_pg_restore(input)?
+    } else {
+        fs::read_to_string(input)?
+    };
 
     // Build statements and COPY blocks. We either collect normal statements (ending with ';')
     // or handle COPY ... FROM stdin blocks which have rows until a line with "\\.".
@@ -103,7 +124,7 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
     // Note: avoid backreferences (not supported by Rust's regex). Accept optional single quotes around the name.
     let re_create_seq = Regex::new(r"(?i)CREATE\s+SEQUENCE\s+'?(?P<name>[^'\s;]+)'?(?:.*?START\s+WITH\s+(?P<start>\d+))?").unwrap();
     let re_setval = Regex::new(r"(?i)setval\s*\(\s*'(?P<name>[^']+)'\s*,\s*(?P<val>\d+)").unwrap();
-    let re_alter_owned = Regex::new(r"(?i)ALTER\s+SEQUENCE\s+'?(?P<name>[^'\s]+)'?\s+OWNED\s+BY\s+'?(?P<table>[^'\.\s]+)'?\.\"?(?P<col>[^'\)\s]+)\"?").unwrap();
+    let re_alter_owned = Regex::new(r"(?i)ALTER\s+SEQUENCE\s+'?(?P<name>[^'\s]+)'?\s+OWNED\s+BY\s+'?(?P<table>[^'\s\.]+)'?\.(?P<col>[^'\)\s]+)").unwrap();
     let re_nextval_name = Regex::new(r"(?i)nextval\(\s*'(?P<name>[^']+)'::regclass\s*\)").unwrap();
     for seg in &segments {
         if let Segment::Stmt(s) = seg {
@@ -213,7 +234,7 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                                             }
                                             // also check sequences map for an owned sequence matching this table.col
                                             if seq_last.is_none() {
-                                                for (sname, si) in sequences.iter() {
+                                                for (_sname, si) in sequences.iter() {
                                                     if let Some((ref t, ref c)) = si.owned {
                                                         if t == &tbl_name && c == &ci.name {
                                                             seq_last = si.last_value.or(si.start);
@@ -261,7 +282,7 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                                             let batch_size = std::cmp::min(default_batch, max_batch);
 
                                             let mut batch: Vec<Vec<rusqlite::types::Value>> = Vec::with_capacity(batch_size);
-                                            let mut flush_batch = |batch: &mut Vec<Vec<rusqlite::types::Value>>| {
+                                            let flush_batch = |batch: &mut Vec<Vec<rusqlite::types::Value>>| {
                                                 if batch.is_empty() { return; }
                                                 let row_count = batch.len();
                                                 let mut placeholders_row: Vec<String> = Vec::new();
@@ -286,6 +307,9 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                                                     }
                                                     Err(e) => eprintln!("warning: failed to prepare batch insert for {}: {}", tbl, e),
                                                 }
+                                                if verbose {
+                                                    eprintln!("flushed {} rows into {}", row_count, tbl);
+                                                }
                                                 batch.clear();
                                             };
 
@@ -306,6 +330,9 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                                                 }
                                             }
                                             flush_batch(&mut batch);
+                                            if verbose {
+                                                eprintln!("INSERT into {}: total batched rows processed (approx)", tbl);
+                                            }
                                         }
                                     }
                                 }
@@ -347,8 +374,9 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                     eprintln!("warning: malformed COPY header: {}", header);
                     continue;
                 }
-                // crude parse
+                // crude parse to find table and column list; also detect CSV/FORMAT csv
                 let after_copy = header[5..].trim();
+                let is_csv = upper.contains(" CSV") || upper.contains("FORMAT CSV");
                 if let Some(pos) = after_copy.find("(") {
                     let table = after_copy[..pos].trim();
                     if let Some(end_cols) = after_copy.find(")") {
@@ -366,21 +394,135 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                             }
                         };
 
-                        for row in rows {
-                            // split on tabs
-                            let fields: Vec<&str> = row.split('\t').collect();
-                            let mut values: Vec<rusqlite::types::Value> = Vec::new();
-                            for f in fields.iter() {
-                                if *f == "\\N" {
-                                    values.push(rusqlite::types::Value::Null);
-                                } else {
-                                    let un = unescape_copy_field(f);
-                                    values.push(rusqlite::types::Value::from(un));
+                        if is_csv {
+                            // Stream CSV rows without joining into a single large string.
+                            // Create a small reader that emits each row followed by a newline.
+                            struct RowsReader {
+                                rows: Vec<String>,
+                                idx: usize,
+                                pos: usize,
+                            }
+                            impl std::io::Read for RowsReader {
+                                fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                                    if self.idx >= self.rows.len() {
+                                        return Ok(0);
+                                    }
+                                    let mut written = 0usize;
+                                    while written < buf.len() && self.idx < self.rows.len() {
+                                        let cur = &self.rows[self.idx];
+                                        let cur_bytes = cur.as_bytes();
+                                        // write remaining bytes from current row
+                                        if self.pos < cur_bytes.len() {
+                                            let rem = cur_bytes.len() - self.pos;
+                                            let take = std::cmp::min(rem, buf.len() - written);
+                                            buf[written..written+take].copy_from_slice(&cur_bytes[self.pos..self.pos+take]);
+                                            written += take;
+                                            self.pos += take;
+                                        }
+                                        // if we've finished the row and there's room, write a newline and advance
+                                        if self.pos >= cur_bytes.len() && written < buf.len() {
+                                            buf[written] = b'\n';
+                                            written += 1;
+                                            self.idx += 1;
+                                            self.pos = 0;
+                                        }
+                                        // if buffer full, break and return what we've written so far
+                                    }
+                                    Ok(written)
                                 }
                             }
-                            // execute insert
-                            if let Err(e) = stmt.execute(rusqlite::params_from_iter(values.iter())) {
-                                eprintln!("warning: failed to insert COPY row into {}: {}", table, e);
+
+                            let reader = RowsReader { rows, idx: 0, pos: 0 };
+                            let mut rdr = ReaderBuilder::new()
+                                .has_headers(false)
+                                .from_reader(reader);
+
+                            // Batch insertion for CSV rows
+                            const SQLITE_MAX_VARS: usize = 32766;
+                            let default_batch: usize = env::var("PG2LITE_BATCH").ok().and_then(|s| s.parse().ok()).unwrap_or(500);
+                            let cols_per_row = col_names.len().max(1);
+                            let max_batch = std::cmp::max(1, SQLITE_MAX_VARS / cols_per_row);
+                            let batch_size = std::cmp::min(default_batch, max_batch);
+
+                            let mut batch: Vec<Vec<rusqlite::types::Value>> = Vec::with_capacity(batch_size);
+                            let start = Instant::now();
+                            let mut total_rows: usize = 0;
+                            let flush_batch = |batch: &mut Vec<Vec<rusqlite::types::Value>>| {
+                                if batch.is_empty() { return; }
+                                let row_count = batch.len();
+                                let mut placeholders_row: Vec<String> = Vec::new();
+                                for _ in 0..cols_per_row { placeholders_row.push("?".to_string()); }
+                                let single = format!("({})", placeholders_row.join(","));
+                                let all = std::iter::repeat(single).take(row_count).collect::<Vec<_>>().join(",");
+                                let sql = format!("INSERT INTO {} ({}) VALUES {};", table, col_names.join(", "), all);
+                                // flatten params
+                                let mut flat: Vec<rusqlite::types::Value> = Vec::with_capacity(row_count * cols_per_row);
+                                for r in batch.iter() { for v in r.iter() { flat.push(v.clone()); } }
+                                match tx.prepare(&sql) {
+                                    Ok(mut pst) => {
+                                        if let Err(e) = pst.execute(rusqlite::params_from_iter(flat.iter())) {
+                                            eprintln!("warning: failed batch insert into {}: {}", table, e);
+                                        }
+                                    }
+                                    Err(e) => eprintln!("warning: failed to prepare batch insert for {}: {}", table, e),
+                                }
+                                if verbose {
+                                    eprintln!("flushed {} rows into {}", row_count, table);
+                                }
+                                batch.clear();
+                            };
+
+                            for result in rdr.records() {
+                                match result {
+                                    Ok(rec) => {
+                                        let mut vals: Vec<rusqlite::types::Value> = Vec::with_capacity(cols_per_row);
+                                        for f in rec.iter() {
+                                            if f == "\\N" {
+                                                vals.push(rusqlite::types::Value::Null);
+                                            } else {
+                                                vals.push(rusqlite::types::Value::from(f.to_string()));
+                                            }
+                                        }
+                                        // if record has fewer fields, pad with NULLs
+                                        while vals.len() < cols_per_row { vals.push(rusqlite::types::Value::Null); }
+                                        batch.push(vals);
+                                        total_rows += 1;
+                                        if batch.len() >= batch_size {
+                                            flush_batch(&mut batch);
+                                        }
+                                    }
+                                    Err(e) => eprintln!("warning: failed to parse CSV COPY row: {}", e),
+                                }
+                            }
+                            flush_batch(&mut batch);
+                            if verbose {
+                                let elapsed = start.elapsed();
+                                eprintln!("COPY into {}: processed {} rows in {:?}", table, total_rows, elapsed);
+                            }
+                        } else {
+                            let start = Instant::now();
+                            let mut total_rows = 0usize;
+                            for row in rows {
+                                // split on tabs
+                                let fields: Vec<&str> = row.split('\t').collect();
+                                let mut values: Vec<rusqlite::types::Value> = Vec::new();
+                                for f in fields.iter() {
+                                    if *f == "\\N" {
+                                        values.push(rusqlite::types::Value::Null);
+                                    } else {
+                                        let un = unescape_copy_field(f);
+                                        values.push(rusqlite::types::Value::from(un));
+                                    }
+                                }
+                                // execute insert
+                                if let Err(e) = stmt.execute(rusqlite::params_from_iter(values.iter())) {
+                                    eprintln!("warning: failed to insert COPY row into {}: {}", table, e);
+                                }
+                                total_rows += 1;
+                            }
+                            if verbose {
+                                let elapsed = start.elapsed();
+                                eprintln!("COPY into {}: processed {} rows in {:?}", table, total_rows, elapsed);
                             }
                         }
                     }
@@ -451,6 +593,34 @@ fn unescape_copy_field(s: &str) -> String {
     out
 }
 
+// Detects PostgreSQL custom dump format by checking the file header for the
+// custom-format magic bytes (starts with "PGDMP" in ASCII).
+fn is_custom_pg_dump(path: &PathBuf) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = [0u8; 5];
+    let n = f.read(&mut buf)?;
+    if n < 5 { return Ok(false); }
+    Ok(&buf == b"PGDMP")
+}
+
+// Run `pg_restore --format=custom --file=- <path>` to emit SQL to stdout.
+// Returns the SQL output as a String.
+fn run_pg_restore(path: &PathBuf) -> Result<String, Box<dyn std::error::Error>> {
+    // Ensure pg_restore is available
+    let pg_restore = which::which("pg_restore").map_err(|_| {
+        format!("pg_restore not found in PATH; required to extract custom-format PostgreSQL dumps")
+    })?;
+    let output = Command::new(pg_restore)
+        .arg("--format=custom")
+        .arg("--verbose")
+        .arg("--file=-")
+        .arg(path.as_os_str())
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("pg_restore failed: {}", String::from_utf8_lossy(&output.stderr)).into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
