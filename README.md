@@ -24,6 +24,27 @@ Features
 - Detects and maps PostgreSQL sequences (CREATE SEQUENCE, `setval`, `ALTER SEQUENCE ... OWNED BY`) into SQLite `AUTOINCREMENT` behavior and updates `sqlite_sequence` accordingly.
 - Supports PostgreSQL custom-format dumps: if a dump file has the `PGDMP` header the tool will try to run `pg_restore` to extract plain SQL (requires `pg_restore` on `PATH`).
 
+Examples
+
+- The `examples/` directory includes a variety of sample dumps used by the tests. In particular
+  `examples/employees.sql.gz` is a custom-format pg_dump of the sample "employees" database and
+  is used by `tests/employees.rs` to exercise conversion of a real custom-format archive.
+
+Testing notes
+
+- Run the test suite with: `cargo test`.
+- Some integration tests (for example the employees conversion test) require `pg_restore` to be
+  available on PATH because they operate on PostgreSQL custom-format archives. If `pg_restore` is
+  not available the test will skip with a short message. On CI you should install the PostgreSQL
+  client tools (or ensure `pg_restore` is present) to run the full test set.
+
+Development notes
+
+- The converter emits helpful verbose logs when invoked with `-v` / `--verbose` — this is useful
+  when inspecting why a COPY block or CREATE TABLE was skipped or translated.
+- There are conservative textual transforms and sqlparser-based translations; if you add new
+  translation logic please include tests in `tests/` and keep commits small and focused.
+
 Building and testing
 
 - Build: `cargo build` (or `cargo build --release` for better performance).
