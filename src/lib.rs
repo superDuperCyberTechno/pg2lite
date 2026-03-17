@@ -5,7 +5,7 @@ use std::fs;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use rusqlite::params;
-use sqlparser::ast::{Statement, ObjectName, Value as SQLValue, Expr, TableConstraint, ColumnOption};
+use sqlparser::ast::{Statement, Value as SQLValue, Expr, TableConstraint, ColumnOption};
 use std::env;
 
 /// Convert a PostgreSQL dump file at `input` into a SQLite database at `output`.
@@ -100,9 +100,10 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
     use std::collections::HashMap;
     struct SeqInfo { start: Option<i64>, last_value: Option<i64>, owned: Option<(String, String)> }
     let mut sequences: HashMap<String, SeqInfo> = HashMap::new();
-    let re_create_seq = Regex::new(r"(?i)CREATE\s+SEQUENCE\s+('?)(?P<name>[^'\s;]+)\1(?:.*?START\s+WITH\s+(?P<start>\d+))?").unwrap();
+    // Note: avoid backreferences (not supported by Rust's regex). Accept optional single quotes around the name.
+    let re_create_seq = Regex::new(r"(?i)CREATE\s+SEQUENCE\s+'?(?P<name>[^'\s;]+)'?(?:.*?START\s+WITH\s+(?P<start>\d+))?").unwrap();
     let re_setval = Regex::new(r"(?i)setval\s*\(\s*'(?P<name>[^']+)'\s*,\s*(?P<val>\d+)").unwrap();
-    let re_alter_owned = Regex::new(r#"(?i)ALTER\s+SEQUENCE\s+('?)(?P<name>[^'\s]+)\1\s+OWNED\s+BY\s+('?)(?P<table>[^'.\s]+)\3\.(?:"?(?P<col>[^'\)\s]+)"?)"#).unwrap();
+    let re_alter_owned = Regex::new(r"(?i)ALTER\s+SEQUENCE\s+'?(?P<name>[^'\s]+)'?\s+OWNED\s+BY\s+'?(?P<table>[^'\.\s]+)'?\.\"?(?P<col>[^'\)\s]+)\"?").unwrap();
     let re_nextval_name = Regex::new(r"(?i)nextval\(\s*'(?P<name>[^']+)'::regclass\s*\)").unwrap();
     for seg in &segments {
         if let Segment::Stmt(s) = seg {
