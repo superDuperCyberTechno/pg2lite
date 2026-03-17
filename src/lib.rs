@@ -43,7 +43,13 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
         }
 
         // detect COPY start
-        if trimmed.to_uppercase().starts_with("COPY ") && trimmed.to_uppercase().contains(" FROM stdin") {
+        let up = trimmed.to_uppercase();
+        if up.starts_with("COPY ") && up.contains(" FROM STDIN") {
+            // flush any pending statement before entering COPY
+            if !cur.trim().is_empty() {
+                segments.push(Segment::Stmt(cur.clone()));
+                cur.clear();
+            }
             in_copy = true;
             copy_header = line.to_string();
             continue;
