@@ -30,6 +30,10 @@ Examples
   `examples/employees.sql.gz` is a custom-format pg_dump of the sample "employees" database and
   is used by `tests/employees.rs` to exercise conversion of a real custom-format archive.
 
+  Credit: the sample "employees" database dump used in `examples/employees.sql.gz` is
+  provided by github.com/neondatabase/postgres-sample-dbs — thanks to that project for
+  making realistic PostgreSQL sample databases available for testing and examples.
+
 Testing notes
 
 - Run the test suite with: `cargo test`.
