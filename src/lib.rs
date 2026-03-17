@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::fs;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
-use sqlparser::ast::{Statement, ObjectName, Value as SQLValue};
+use sqlparser::ast::{Statement, ObjectName, Value as SQLValue, Expr};
 
 /// Convert a PostgreSQL dump file at `input` into a SQLite database at `output`.
 pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -108,10 +108,8 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                                         }
                                         typ = typ.replace("BYTEA", "BLOB");
                                         typ = typ.replace("BOOLEAN", "INTEGER").replace("boolean", "INTEGER");
-                                        let mut def = format!("{} {}", col.name, typ);
-                                        if col.options.iter().any(|o| matches!(o.option, sqlparser::ast::ColumnOption::Unique { is_primary: true } | sqlparser::ast::ColumnOption::Unique { is_primary: false })) {
-                                            // leave as is
-                                        }
+                                        let mut def = format!("{} {}", col.name.to_string(), typ);
+                                        // keep simple: don't try to map constraints here
                                         col_defs.push(def);
                                     }
                                     let create_sql = format!("CREATE TABLE {} ({});", tbl_name, col_defs.join(", "));
@@ -122,20 +120,24 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                                 Statement::Insert { table_name, columns, source, .. } => {
                                     // Build INSERT statement with values from AST
                                     let tbl = table_name.to_string();
+                                    let columns_str = if columns.is_empty() { None } else { Some(columns.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")) };
                                     // extract values from source if it's a Values
                                     if let sqlparser::ast::SetExpr::Values(values) = *source.body.clone() {
-                                        for row in values.0 {
+                                        for row in values.rows {
                                             let mut vals: Vec<rusqlite::types::Value> = Vec::new();
-                                            for v in row { 
-                                                match v {
-                                                    SQLValue::Number(s, _) => {
+                                            for expr in row {
+                                                match expr {
+                                                    Expr::Value(SQLValue::Number(s, _)) => {
                                                         vals.push(rusqlite::types::Value::from(s));
                                                     }
-                                                    SQLValue::SingleQuotedString(s) => {
+                                                    Expr::Value(SQLValue::SingleQuotedString(s)) => {
                                                         vals.push(rusqlite::types::Value::from(s));
                                                     }
-                                                    SQLValue::Boolean(b) => {
+                                                    Expr::Value(SQLValue::Boolean(b)) => {
                                                         vals.push(rusqlite::types::Value::from(if b {1} else {0}));
+                                                    }
+                                                    Expr::Value(SQLValue::Null) => {
+                                                        vals.push(rusqlite::types::Value::Null);
                                                     }
                                                     _ => {
                                                         vals.push(rusqlite::types::Value::Null);
@@ -144,7 +146,11 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                                             }
                                             // construct placeholder list
                                             let placeholders: Vec<&str> = (0..vals.len()).map(|_| "?").collect();
-                                            let sql = format!("INSERT INTO {} ({}) VALUES ({});", tbl, if columns.is_empty() { "" } else { &columns.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ") }, placeholders.join(", "));
+                                            let sql = if let Some(ref cols) = columns_str {
+                                                format!("INSERT INTO {} ({}) VALUES ({});", tbl, cols, placeholders.join(", "))
+                                            } else {
+                                                format!("INSERT INTO {} VALUES ({});", tbl, placeholders.join(", "))
+                                            };
                                             // prepare and execute
                                             match tx.prepare(&sql) {
                                                 Ok(mut pst) => {
