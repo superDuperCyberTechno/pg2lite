@@ -8,6 +8,8 @@ license = "MIT"
 
 [dependencies]
 clap = { version = "4.3", features = ["derive"] }
+rusqlite = "0.29"
+regex = "1"
 
 [dev-dependencies]
 assert_cmd = "2"
