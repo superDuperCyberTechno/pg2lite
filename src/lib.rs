@@ -7,41 +7,79 @@ use std::fs;
 pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let contents = fs::read_to_string(input)?;
 
-    // Build statements by collecting lines until a semicolon terminator.
-    let mut stmts: Vec<String> = Vec::new();
+    // Build statements and COPY blocks. We either collect normal statements (ending with ';')
+    // or handle COPY ... FROM stdin blocks which have rows until a line with "\\.".
+    #[derive(Debug)]
+    enum Segment {
+        Stmt(String),
+        Copy { header: String, rows: Vec<String> },
+    }
+
+    let mut segments: Vec<Segment> = Vec::new();
     let mut cur = String::new();
-    for line in contents.lines() {
+    let mut in_copy = false;
+    let mut copy_header = String::new();
+    let mut copy_rows: Vec<String> = Vec::new();
+
+    for raw_line in contents.lines() {
+        let line = raw_line;
         let trimmed = line.trim_start();
         // skip SQL comments
-        if trimmed.starts_with("--") {
+        if trimmed.starts_with("--") && !in_copy {
             continue;
         }
+
+        if in_copy {
+            if line == "\\." {
+                // end of copy
+                segments.push(Segment::Copy { header: copy_header.clone(), rows: copy_rows.clone() });
+                in_copy = false;
+                copy_header.clear();
+                copy_rows.clear();
+            } else {
+                copy_rows.push(line.to_string());
+            }
+            continue;
+        }
+
+        // detect COPY start
+        if trimmed.to_uppercase().starts_with("COPY ") && trimmed.to_uppercase().contains(" FROM stdin") {
+            in_copy = true;
+            copy_header = line.to_string();
+            continue;
+        }
+
         cur.push_str(line);
         cur.push('\n');
         if trimmed.ends_with(';') {
             let s = cur.trim().to_string();
             cur.clear();
             if !s.is_empty() {
-                stmts.push(s);
+                segments.push(Segment::Stmt(s));
             }
         }
     }
     if !cur.trim().is_empty() {
-        stmts.push(cur);
+        segments.push(Segment::Stmt(cur));
     }
 
     let re_serial = Regex::new(r"(?i)\bSERIAL\b")?;
     let re_nextval = Regex::new(r"(?i)DEFAULT\s+nextval\('[^']+'::regclass\)")?;
     let re_e_quote = Regex::new(r"E'")?;
 
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut conn = Connection::open(output)?;
     let tx = conn.transaction()?;
 
-    for stmt in stmts {
-        let s = stmt.trim();
-        if s.is_empty() {
-            continue;
-        }
+    for seg in segments {
+        match seg {
+            Segment::Stmt(stmt) => {
+                let s = stmt.trim();
+                if s.is_empty() {
+                    continue;
+                }
 
         let s_upper = s.to_uppercase();
         // Skip unsupported statements
@@ -73,8 +111,58 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
         }
 
         // Execute statement; continue on error but print a warning so the user can inspect.
-        if let Err(e) = tx.execute_batch(&tstmt) {
-            eprintln!("warning: failed to execute statement starting with '{}': {}", &tstmt.lines().next().unwrap_or(""), e);
+                if let Err(e) = tx.execute_batch(&tstmt) {
+                    eprintln!("warning: failed to execute statement starting with '{}': {}", &tstmt.lines().next().unwrap_or(""), e);
+                }
+            }
+            Segment::Copy { header, rows } => {
+                // parse header like: COPY tablename (col1, col2) FROM stdin;
+                // We'll extract the table name and column list.
+                let upper = header.to_uppercase();
+                if !upper.starts_with("COPY ") {
+                    eprintln!("warning: malformed COPY header: {}", header);
+                    continue;
+                }
+                // crude parse
+                let after_copy = header[5..].trim();
+                if let Some(pos) = after_copy.find("(") {
+                    let table = after_copy[..pos].trim();
+                    if let Some(end_cols) = after_copy.find(")") {
+                        let cols = &after_copy[pos+1..end_cols];
+                        let col_names: Vec<String> = cols.split(',').map(|s| s.trim().to_string()).collect();
+
+                        // prepare insert statement
+                        let placeholders: Vec<String> = col_names.iter().map(|_| "?".to_string()).collect();
+                        let sql = format!("INSERT INTO {} ({}) VALUES ({});", table, col_names.join(", "), placeholders.join(", "));
+                        let mut stmt = match tx.prepare(&sql) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("warning: failed to prepare insert for COPY into {}: {}", table, e);
+                                continue;
+                            }
+                        };
+
+                        for row in rows {
+                            // split on tabs
+                            let fields: Vec<&str> = row.split('\t').collect();
+                            let mut values: Vec<rusqlite::types::Value> = Vec::new();
+                            for f in fields.iter() {
+                                if *f == "\\N" {
+                                    values.push(rusqlite::types::Value::Null);
+                                } else {
+                                    // unescape backslashes like \n -> newline, \t -> tab, \\\ -> \
+                                    let un = f.replace("\\n", "\n").replace("\\t", "\t").replace("\\\\", "\\");
+                                    values.push(rusqlite::types::Value::from(un));
+                                }
+                            }
+                            // execute insert
+                            if let Err(e) = stmt.execute(rusqlite::params_from_iter(values.iter())) {
+                                eprintln!("warning: failed to insert COPY row into {}: {}", table, e);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
