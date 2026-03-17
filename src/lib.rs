@@ -156,8 +156,7 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                                 if *f == "\\N" {
                                     values.push(rusqlite::types::Value::Null);
                                 } else {
-                                    // unescape backslashes like \n -> newline, \t -> tab, \\\ -> \
-                                    let un = f.replace("\\n", "\n").replace("\\t", "\t").replace("\\\\", "\\");
+                                    let un = unescape_copy_field(f);
                                     values.push(rusqlite::types::Value::from(un));
                                 }
                             }
@@ -174,4 +173,59 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
 
     tx.commit()?;
     Ok(())
+}
+
+// Unescape COPY field content according to PostgreSQL text format rules (basic subset).
+fn unescape_copy_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        // escape sequence
+        match chars.next() {
+            Some('b') => out.push('\x08' as char),
+            Some('f') => out.push('\x0C' as char),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('v') => out.push('\x0B' as char),
+            Some('\\') => out.push('\\'),
+            Some(ch) if ch.is_digit(8) => {
+                // octal sequence: up to 3 octal digits, we already consumed one
+                let mut oct = ch.to_digit(8).unwrap();
+                for _ in 0..2 {
+                    if let Some(next) = chars.peek() {
+                        if next.is_digit(8) {
+                            let d = chars.next().unwrap().to_digit(8).unwrap();
+                            oct = oct * 8 + d;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                if let Some(byte) = std::char::from_u32(oct) {
+                    out.push(byte);
+                }
+            }
+            Some(other) => out.push(other),
+            None => break,
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unescape_copy_field() {
+        assert_eq!(unescape_copy_field("Hello\\nWorld"), "Hello\nWorld");
+        assert_eq!(unescape_copy_field("Tab\\tHere"), "Tab\tHere");
+        assert_eq!(unescape_copy_field("Oct\\123"), String::from_utf8(vec![b'O', 0o123]).unwrap_or_default());
+        assert_eq!(unescape_copy_field("Back\\\\Slash"), "Back\\Slash");
+    }
 }
