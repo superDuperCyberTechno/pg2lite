@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::Parser;
+use pg2lite::convert_dump_to_sqlite;
 
 /// pg2lite — convert PostgreSQL dump files to SQLite
 #[derive(Parser)]
@@ -14,7 +15,6 @@ struct Args {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Perform the conversion and write the SQLite database (default)
 }
 
 fn main() {
@@ -37,5 +37,3 @@ fn main() {
         process::exit(3);
     }
 }
-
-use pg2lite::convert_dump_to_sqlite;
