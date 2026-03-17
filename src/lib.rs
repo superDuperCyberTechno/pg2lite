@@ -6,6 +6,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use rusqlite::params;
 use sqlparser::ast::{Statement, ObjectName, Value as SQLValue, Expr, TableConstraint, ColumnOption};
+use std::env;
 
 /// Convert a PostgreSQL dump file at `input` into a SQLite database at `output`.
 pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -190,52 +191,65 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                                     }
                                 }
                                 Statement::Insert { table_name, columns, source, .. } => {
-                                    // Build INSERT statement with values from AST. Prepare the
-                                    // statement once per INSERT source and reuse it for all rows
-                                    // to avoid repeated parse/prepare overhead.
+                                    // Build INSERT statement with values from AST. We'll batch rows
+                                    // into multi-row INSERTs to reduce per-row overhead.
                                     let tbl = table_name.to_string();
                                     let columns_str = if columns.is_empty() { None } else { Some(columns.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")) };
                                     if let sqlparser::ast::SetExpr::Values(values) = *source.body.clone() {
-                                        // construct placeholder list based on first row's length
+                                        // prepare batching parameters
+                                        const SQLITE_MAX_VARS: usize = 32766;
+                                        let default_batch: usize = env::var("PG2LITE_BATCH").ok().and_then(|s| s.parse().ok()).unwrap_or(500);
                                         if let Some(first_row) = values.rows.get(0) {
-                                            let param_count = first_row.len();
-                                            let placeholders: Vec<&str> = (0..param_count).map(|_| "?").collect();
-                                            let sql = if let Some(ref cols) = columns_str {
-                                                format!("INSERT INTO {} ({}) VALUES ({});", tbl, cols, placeholders.join(", "))
-                                            } else {
-                                                format!("INSERT INTO {} VALUES ({});", tbl, placeholders.join(", "))
-                                            };
+                                            let cols_per_row = first_row.len();
+                                            let max_batch = std::cmp::max(1, SQLITE_MAX_VARS / cols_per_row);
+                                            let batch_size = std::cmp::min(default_batch, max_batch);
 
-                                            match tx.prepare(&sql) {
-                                                Ok(mut pst) => {
-                                                    for row in values.rows {
-                                                        let mut vals: Vec<rusqlite::types::Value> = Vec::new();
-                                                        for expr in row {
-                                                            match expr {
-                                                                Expr::Value(SQLValue::Number(s, _)) => {
-                                                                    vals.push(rusqlite::types::Value::from(s));
-                                                                }
-                                                                Expr::Value(SQLValue::SingleQuotedString(s)) => {
-                                                                    vals.push(rusqlite::types::Value::from(s));
-                                                                }
-                                                                Expr::Value(SQLValue::Boolean(b)) => {
-                                                                    vals.push(rusqlite::types::Value::from(if b {1} else {0}));
-                                                                }
-                                                                Expr::Value(SQLValue::Null) => {
-                                                                    vals.push(rusqlite::types::Value::Null);
-                                                                }
-                                                                _ => {
-                                                                    vals.push(rusqlite::types::Value::Null);
-                                                                }
-                                                            }
-                                                        }
-                                                        if let Err(e) = pst.execute(rusqlite::params_from_iter(vals.iter())) {
-                                                            eprintln!("warning: failed to insert parsed row into {}: {}", tbl, e);
+                                            let mut batch: Vec<Vec<rusqlite::types::Value>> = Vec::with_capacity(batch_size);
+                                            let mut flush_batch = |batch: &mut Vec<Vec<rusqlite::types::Value>>| {
+                                                if batch.is_empty() { return; }
+                                                let row_count = batch.len();
+                                                let mut placeholders_row: Vec<String> = Vec::new();
+                                                for _ in 0..cols_per_row {
+                                                    placeholders_row.push("?".to_string());
+                                                }
+                                                let single = format!("({})", placeholders_row.join(","));
+                                                let all = std::iter::repeat(single).take(row_count).collect::<Vec<_>>().join(",");
+                                                let sql = if let Some(ref cols) = columns_str {
+                                                    format!("INSERT INTO {} ({}) VALUES {};", tbl, cols, all)
+                                                } else {
+                                                    format!("INSERT INTO {} VALUES {};", tbl, all)
+                                                };
+                                                // flatten params
+                                                let mut flat: Vec<rusqlite::types::Value> = Vec::with_capacity(row_count * cols_per_row);
+                                                for r in batch.iter() { for v in r.iter() { flat.push(v.clone()); } }
+                                                match tx.prepare(&sql) {
+                                                    Ok(mut pst) => {
+                                                        if let Err(e) = pst.execute(rusqlite::params_from_iter(flat.iter())) {
+                                                            eprintln!("warning: failed batch insert into {}: {}", tbl, e);
                                                         }
                                                     }
+                                                    Err(e) => eprintln!("warning: failed to prepare batch insert for {}: {}", tbl, e),
                                                 }
-                                                Err(e) => eprintln!("warning: failed to prepare insert for {}: {}", tbl, e),
+                                                batch.clear();
+                                            };
+
+                                            for row in values.rows {
+                                                let mut vals: Vec<rusqlite::types::Value> = Vec::with_capacity(cols_per_row);
+                                                for expr in row {
+                                                    match expr {
+                                                        Expr::Value(SQLValue::Number(s, _)) => vals.push(rusqlite::types::Value::from(s)),
+                                                        Expr::Value(SQLValue::SingleQuotedString(s)) => vals.push(rusqlite::types::Value::from(s)),
+                                                        Expr::Value(SQLValue::Boolean(b)) => vals.push(rusqlite::types::Value::from(if b {1} else {0})),
+                                                        Expr::Value(SQLValue::Null) => vals.push(rusqlite::types::Value::Null),
+                                                        _ => vals.push(rusqlite::types::Value::Null),
+                                                    }
+                                                }
+                                                batch.push(vals);
+                                                if batch.len() >= batch_size {
+                                                    flush_batch(&mut batch);
+                                                }
                                             }
+                                            flush_batch(&mut batch);
                                         }
                                     }
                                 }
