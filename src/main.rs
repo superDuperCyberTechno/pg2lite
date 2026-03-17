@@ -42,7 +42,7 @@ fn main() {
     }
 }
 
-fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     use regex::Regex;
     use rusqlite::Connection;
     use std::fs;
@@ -76,7 +76,7 @@ fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), Box<d
     let re_nextval = Regex::new(r"(?i)DEFAULT\s+nextval\('[^']+'::regclass\)")?;
     let re_e_quote = Regex::new(r"E'")?;
 
-    let conn = Connection::open(output)?;
+    let mut conn = Connection::open(output)?;
     let tx = conn.transaction()?;
 
     for stmt in stmts {
