@@ -102,7 +102,7 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
     let mut sequences: HashMap<String, SeqInfo> = HashMap::new();
     let re_create_seq = Regex::new(r"(?i)CREATE\s+SEQUENCE\s+('?)(?P<name>[^'\s;]+)\1(?:.*?START\s+WITH\s+(?P<start>\d+))?").unwrap();
     let re_setval = Regex::new(r"(?i)setval\s*\(\s*'(?P<name>[^']+)'\s*,\s*(?P<val>\d+)").unwrap();
-    let re_alter_owned = Regex::new(r"(?i)ALTER\s+SEQUENCE\s+('?)(?P<name>[^'\s]+)\1\s+OWNED\s+BY\s+('?)(?P<table>[^'.\s]+)\3\.(?:"?(?P<col>[^'\)\s]+)"?)").unwrap();
+    let re_alter_owned = Regex::new(r#"(?i)ALTER\s+SEQUENCE\s+('?)(?P<name>[^'\s]+)\1\s+OWNED\s+BY\s+('?)(?P<table>[^'.\s]+)\3\.(?:"?(?P<col>[^'\)\s]+)"?)"#).unwrap();
     let re_nextval_name = Regex::new(r"(?i)nextval\(\s*'(?P<name>[^']+)'::regclass\s*\)").unwrap();
     for seg in &segments {
         if let Segment::Stmt(s) = seg {
@@ -123,7 +123,7 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                 let name = cap.name("name").unwrap().as_str().to_string();
                 let table = cap.name("table").unwrap().as_str().to_string();
                 let col = cap.name("col").unwrap().as_str().to_string();
-                sequences.entry(name.clone()).or_insert(SeqInfo { start: None, last_value: None, owned: Some((table.clone(), col.clone())) }).owned = Some((table, col));
+                sequences.entry(name.clone()).or_insert(SeqInfo { start: None, last_value: None, owned: Some((table.clone(), col.clone())) }).owned = Some((table.clone(), col.clone()));
             }
         }
     }
