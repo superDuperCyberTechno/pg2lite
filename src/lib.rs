@@ -9,7 +9,9 @@ use sqlparser::ast::{Statement, Value as SQLValue, Expr, TableConstraint, Column
 use std::env;
 use csv::ReaderBuilder;
 use std::process::Command;
-use std::io::Read;
+use std::io::{Read, Seek};
+use flate2::read::GzDecoder;
+use tempfile::NamedTempFile;
 use std::time::Instant;
 
 /// Convert a PostgreSQL dump file at `input` into a SQLite database at `output`.
@@ -24,7 +26,7 @@ pub fn convert_dump_to_sqlite_with_verbose(input: &PathBuf, output: &PathBuf, ve
     // Support PostgreSQL custom-format dumps by detecting the magic header and
     // using `pg_restore` to extract plain SQL. If not a custom-format dump,
     // read the file contents directly.
-    let contents = if is_custom_pg_dump(input)? {
+    let mut contents = if is_custom_pg_dump(input)? {
         if verbose {
             eprintln!("detected custom-format dump; attempting to run pg_restore...");
         }
@@ -32,6 +34,39 @@ pub fn convert_dump_to_sqlite_with_verbose(input: &PathBuf, output: &PathBuf, ve
     } else {
         fs::read_to_string(input)?
     };
+
+    // Pre-clean common Postgres-specific tokens that confuse the splitter/parser.
+    // Remove psql meta-commands that start with a backslash at the start of a line.
+    contents = contents
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            // drop lines that start with backslash (psql meta-commands) except COPY terminator `\\.`
+            !(t.starts_with('\\') && t != "\\.")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Case-insensitive removals for timezone qualifiers and USING btree
+    let re_without_tz = Regex::new(r#"(?i)without\s+time\s+zone"#).unwrap();
+    contents = re_without_tz.replace_all(&contents, "").to_string();
+    let re_with_tz = Regex::new(r#"(?i)with\s+time\s+zone"#).unwrap();
+    contents = re_with_tz.replace_all(&contents, "").to_string();
+    let re_using_btree = Regex::new(r#"(?i)\s+USING\s+btree"#).unwrap();
+    contents = re_using_btree.replace_all(&contents, "").to_string();
+
+    // Normalize common type names (case-insensitive replacements)
+    let re_char_vary = Regex::new(r#"(?i)character\s+varying"#).unwrap();
+    contents = re_char_vary.replace_all(&contents, "text").to_string();
+    // normalize timestamp(...) types to TEXT
+    let re_timestamp = Regex::new(r#"(?i)timestamp\s*\([^)]*\)"#).unwrap();
+    contents = re_timestamp.replace_all(&contents, "TEXT").to_string();
+    // Normalize varchar/character varying/text with size to plain text
+    let re_typed_size = Regex::new(r#"(?i)\b(?:character\s+varying|varchar|character|text)\s*\(\s*\d+\s*\)"#).unwrap();
+    contents = re_typed_size.replace_all(&contents, "text").to_string();
+    // Remove any remaining bare numeric size specifiers like `(255)` which can break SQL parsing in SQLite
+    let re_size_only = Regex::new(r#"\(\s*\d+\s*\)"#).unwrap();
+    contents = re_size_only.replace_all(&contents, "").to_string();
 
     // Build statements and COPY blocks. We either collect normal statements (ending with ';')
     // or handle COPY ... FROM stdin blocks which have rows until a line with "\\.".
@@ -154,6 +189,47 @@ pub fn convert_dump_to_sqlite_with_verbose(input: &PathBuf, output: &PathBuf, ve
         match seg {
             Segment::Stmt(stmt) => {
                 let s = stmt.trim();
+                // skip psql meta-commands that start with backslash
+                if s.starts_with('\\') { continue; }
+                // Skip unsupported or non-SQL statements early to avoid noisy errors in SQLite.
+                let s_up = s.to_uppercase();
+                if s_up.starts_with("SET ") || s_up.starts_with("RESET ") || s_up.starts_with("COMMENT ") || s_up.starts_with("GRANT ") || s_up.starts_with("REVOKE ") || s_up.starts_with("CREATE EXTENSION") {
+                    continue;
+                }
+                if s_up.starts_with("ALTER TABLE") {
+                    if s_up.contains("OWNER TO") {
+                        continue;
+                    }
+                    // Try to handle common ALTER TABLE ... ADD CONSTRAINT cases.
+                    // Convert UNIQUE constraints into CREATE UNIQUE INDEX statements
+                    // and ignore PRIMARY KEY constraints (they are handled at table creation).
+                    let re_alter_add = Regex::new(r"(?i)ALTER\s+TABLE\s+(?:ONLY\s+)?(?P<table>[^\s]+)\s+ADD\s+CONSTRAINT\s+(?P<name>[^\s]+)\s+(?P<type>UNIQUE|PRIMARY\s+KEY)\s*\((?P<cols>[^)]+)\)").unwrap();
+                    if let Some(cap) = re_alter_add.captures(s) {
+                        let raw_table = cap.name("table").unwrap().as_str();
+                        let table = normalize_ident(raw_table);
+                        let ctype = cap.name("type").unwrap().as_str().to_uppercase();
+                        let cols = cap.name("cols").unwrap().as_str();
+                        let col_list = cols.split(',').map(|c| c.trim().trim_matches('"').to_string()).collect::<Vec<_>>().join(", ");
+                        let cname = cap.name("name").unwrap().as_str().trim_matches('"');
+                        if ctype.contains("UNIQUE") {
+                            let sql = format!("CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({});", cname, table, col_list);
+                            if let Err(e) = tx.execute_batch(&sql) {
+                                eprintln!("warning: failed to create UNIQUE index {} on {}: {}", cname, table, e);
+                            }
+                        } else {
+                            // PRIMARY KEY via ALTER TABLE: usually redundant; skip
+                        }
+                        continue;
+                    }
+                    // Other ALTER TABLE variants are Postgres-specific; skip them.
+                    continue;
+                }
+                if s_up.starts_with("ALTER SEQUENCE") || s_up.starts_with("CREATE SEQUENCE") {
+                    continue;
+                }
+                if s_up.contains("PG_CATALOG.SETVAL") || s_up.contains("PG_CATALOG.SET_CONFIG") {
+                    continue;
+                }
                 if s.is_empty() {
                     continue;
                 }
@@ -166,17 +242,32 @@ pub fn convert_dump_to_sqlite_with_verbose(input: &PathBuf, output: &PathBuf, ve
                             match st {
                                 Statement::CreateTable { name, columns, constraints, .. } => {
                                     // translate CreateTable into a SQLite-compatible DDL
-                                    let tbl_name = name.to_string();
+                                        // Normalize table name by removing schema qualifiers and surrounding quotes
+                                        let tbl_name = normalize_ident(&name.to_string());
                                     // collect column info first so we can apply table-level constraints
                                     struct ColInfo { name: String, typ: String, not_null: bool, default_nextval: bool, is_primary: bool, seq_name: Option<String> }
                                     let mut cols_info: Vec<ColInfo> = Vec::new();
                                     for col in columns.iter() {
                                         let mut typ = col.data_type.to_string();
-                                        if typ.to_uppercase() == "SERIAL" {
+                                        // normalize common Postgres types to SQLite-friendly types
+                                        let t_up = typ.to_uppercase();
+                                        if t_up.starts_with("SERIAL") || t_up.starts_with("BIGSERIAL") {
                                             typ = "INTEGER".to_string();
+                                        } else if t_up.starts_with("BIGINT") || t_up.starts_with("INT8") || t_up == "INT" || t_up.starts_with("SMALLINT") || t_up.starts_with("INT") {
+                                            // map integer family to INTEGER
+                                            typ = "INTEGER".to_string();
+                                        } else if t_up.starts_with("TIMESTAMP") || t_up.starts_with("DATE") || t_up.starts_with("TIME") {
+                                            // map temporal types to TEXT for portability
+                                            typ = "TEXT".to_string();
+                                        } else if t_up.starts_with("CHARACTER VARYING") || t_up.starts_with("VARCHAR") || t_up.starts_with("CHARACTER") || t_up.starts_with("VARCHAR") {
+                                            typ = "TEXT".to_string();
                                         }
                                         typ = typ.replace("BYTEA", "BLOB");
                                         typ = typ.replace("BOOLEAN", "INTEGER").replace("boolean", "INTEGER");
+                                        // remove any size specifiers like (255) left from type normalization
+                                        if let Ok(re_size) = Regex::new(r"\s*\(\s*\d+\s*\)") {
+                                            typ = re_size.replace_all(&typ, "").to_string();
+                                        }
                                         let mut not_null = false;
                                         let mut default_nextval = false;
                                         let mut is_primary = false;
@@ -262,16 +353,51 @@ pub fn convert_dump_to_sqlite_with_verbose(input: &PathBuf, output: &PathBuf, ve
                                         col_defs.push(pk_clause);
                                     }
 
-                                    let create_sql = format!("CREATE TABLE {} ({});", tbl_name, col_defs.join(", "));
+                                    let mut create_sql = format!("CREATE TABLE IF NOT EXISTS {} ({});", tbl_name, col_defs.join(", "));
+                                    // sanitize create_sql for Postgres-specific fragments that
+                                    // may remain in the generated SQL (safety before execution)
+                                    create_sql = remove_schema_qualifiers(&create_sql);
+                                    create_sql = create_sql.replace("WITHOUT TIME ZONE", "");
+                                    create_sql = create_sql.replace("WITH TIME ZONE", "");
+                                    create_sql = create_sql.replace(" USING btree", "");
+                                    if let Ok(re_ts) = Regex::new(r"(?i)timestamp\([^)]*\)") {
+                                        create_sql = re_ts.replace_all(&create_sql, "TEXT").to_string();
+                                    }
+                                    if verbose { eprintln!("sanitized CREATE TABLE: {}", create_sql); }
                                     if let Err(e) = tx.execute_batch(&create_sql) {
                                         eprintln!("warning: failed to execute CREATE TABLE {}: {}", tbl_name, e);
+                                        // Fallback: try executing a sanitized textual version of the
+                                        // original CREATE TABLE statement (additional sanitization)
+                                        let mut tstmt = remove_schema_qualifiers(&s.to_string());
+                                        tstmt = tstmt.replace("WITHOUT TIME ZONE", "");
+                                        tstmt = tstmt.replace("WITH TIME ZONE", "");
+                                        tstmt = tstmt.replace(" USING btree", "");
+                                        if let Ok(re_ts) = Regex::new(r"(?i)timestamp\([^)]*\)") {
+                                            tstmt = re_ts.replace_all(&tstmt, "TEXT").to_string();
+                                        }
+                                        if verbose { eprintln!("fallback CREATE TABLE attempt: {}", tstmt); }
+                                        if let Err(e2) = tx.execute_batch(&tstmt) {
+                                            eprintln!("warning: fallback CREATE TABLE failed for {}: {}", tbl_name, e2);
+                                        }
                                     }
                                 }
                                 Statement::Insert { table_name, columns, source, .. } => {
                                     // Build INSERT statement with values from AST. We'll batch rows
                                     // into multi-row INSERTs to reduce per-row overhead.
-                                    let tbl = table_name.to_string();
-                                    let columns_str = if columns.is_empty() { None } else { Some(columns.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")) };
+                                    let tbl = normalize_ident(&table_name.to_string());
+                                    // Normalize column identifiers to match CREATE TABLE normalization
+                                    let columns_str = if columns.is_empty() {
+                                        None
+                                    } else {
+                                        Some(columns.iter().map(|c| normalize_ident(&c.to_string())).collect::<Vec<_>>().join(", "))
+                                    };
+                                    if verbose {
+                                        if let Some(ref cols) = columns_str {
+                                            eprintln!("sanitized INSERT target: {} ({})", tbl, cols);
+                                        } else {
+                                            eprintln!("sanitized INSERT target: {} (all columns)", tbl);
+                                        }
+                                    }
                                     if let sqlparser::ast::SetExpr::Values(values) = *source.body.clone() {
                                         // prepare batching parameters
                                         const SQLITE_MAX_VARS: usize = 32766;
@@ -338,7 +464,8 @@ pub fn convert_dump_to_sqlite_with_verbose(input: &PathBuf, output: &PathBuf, ve
                                 }
                                 _ => {
                                     // Fallback: try simple textual transforms for other statements
-                                    let mut tstmt = s.to_string();
+                                    // before executing fallback textual transforms, remove schema qualifiers
+                                    let mut tstmt = remove_schema_qualifiers(&s.to_string());
                                     tstmt = re_serial.replace_all(&tstmt, "INTEGER").to_string();
                                     tstmt = re_nextval.replace_all(&tstmt, "").to_string();
                                     tstmt = tstmt.replace("BYTEA", "BLOB");
@@ -354,9 +481,18 @@ pub fn convert_dump_to_sqlite_with_verbose(input: &PathBuf, output: &PathBuf, ve
                     }
                     Err(e) => {
                         // parsing failed; fallback to previous behaviour
+                        // skip psql meta-commands that start with backslash
+                        if s.trim_start().starts_with('\\') { continue; }
                         let mut tstmt = s.to_string();
+                        // remove schema qualifiers early on in fallback path as well
+                        tstmt = remove_schema_qualifiers(&tstmt);
                         tstmt = re_serial.replace_all(&tstmt, "INTEGER").to_string();
                         tstmt = re_nextval.replace_all(&tstmt, "").to_string();
+                        // remove timezone qualifiers that are Postgres-specific
+                        tstmt = tstmt.replace("WITHOUT TIME ZONE", "");
+                        tstmt = tstmt.replace("WITH TIME ZONE", "");
+                        // strip USING btree from CREATE INDEX
+                        tstmt = tstmt.replace(" USING btree", "");
                         tstmt = tstmt.replace("BYTEA", "BLOB");
                         tstmt = tstmt.replace("boolean", "INTEGER");
                         tstmt = tstmt.replace("BOOLEAN", "INTEGER");
@@ -367,6 +503,7 @@ pub fn convert_dump_to_sqlite_with_verbose(input: &PathBuf, output: &PathBuf, ve
                 }
             }
             Segment::Copy { header, rows } => {
+                if verbose { eprintln!("processing COPY header: '{}' ({} rows captured)", header, rows.len()); }
                 // parse header like: COPY tablename (col1, col2) FROM stdin;
                 // We'll extract the table name and column list.
                 let upper = header.to_uppercase();
@@ -378,19 +515,30 @@ pub fn convert_dump_to_sqlite_with_verbose(input: &PathBuf, output: &PathBuf, ve
                 let after_copy = header[5..].trim();
                 let is_csv = upper.contains(" CSV") || upper.contains("FORMAT CSV");
                 if let Some(pos) = after_copy.find("(") {
-                    let table = after_copy[..pos].trim();
+                    let raw_table = after_copy[..pos].trim();
+                    let table = normalize_ident(raw_table);
                     if let Some(end_cols) = after_copy.find(")") {
                         let cols = &after_copy[pos+1..end_cols];
-                        let col_names: Vec<String> = cols.split(',').map(|s| s.trim().to_string()).collect();
+                        let col_names: Vec<String> = cols.split(',').map(|s| normalize_ident(s.trim())).collect();
 
-                        // prepare insert statement
+                        // prepare insert statement (we'll try column-specified form first, then fallback to VALUES-only)
                         let placeholders: Vec<String> = col_names.iter().map(|_| "?".to_string()).collect();
                         let sql = format!("INSERT INTO {} ({}) VALUES ({});", table, col_names.join(", "), placeholders.join(", "));
+                        if verbose { eprintln!("sanitized COPY -> INSERT mapping: header='{}' -> sql='{}'", header, sql); }
                         let mut stmt = match tx.prepare(&sql) {
                             Ok(s) => s,
                             Err(e) => {
-                                eprintln!("warning: failed to prepare insert for COPY into {}: {}", table, e);
-                                continue;
+                                eprintln!("warning: failed to prepare insert for COPY into {} using columns: {}; error: {}", table, col_names.join(", "), e);
+                                // fallback: try without column list
+                                let alt_sql = format!("INSERT INTO {} VALUES ({});", table, placeholders.join(", "));
+                                if verbose { eprintln!("attempting fallback COPY INSERT SQL: {}", alt_sql); }
+                                match tx.prepare(&alt_sql) {
+                                    Ok(s2) => s2,
+                                    Err(e2) => {
+                                        eprintln!("warning: failed to prepare fallback insert for COPY into {}: {}", table, e2);
+                                        continue;
+                                    }
+                                }
                             }
                         };
 
@@ -593,6 +741,28 @@ fn unescape_copy_field(s: &str) -> String {
     out
 }
 
+// Normalize identifiers by removing schema qualifiers and surrounding double quotes.
+fn normalize_ident(s: &str) -> String {
+    let s = s.trim();
+    // remove all double quotes and whitespace, then strip schema prefix
+    let s = s.replace('"', "");
+    let s = s.trim();
+    if let Some(pos) = s.rfind('.') {
+        return s[pos+1..].to_string();
+    }
+    s.to_string()
+}
+
+// Remove schema qualifiers from statements to avoid `public.` prefixes that SQLite doesn't accept.
+fn remove_schema_qualifiers(s: &str) -> String {
+    // Remove schema qualifiers like `public.table` or `"schema"."table"`.
+    // This simple regex strips an optional quoted identifier or bare identifier
+    // followed by a dot. It is intentionally conservative to avoid touching
+    // other SQL tokens.
+    let re = Regex::new(r#"(?i)"?[_A-Za-z][\w]*"?\."#).unwrap_or_else(|_| Regex::new(r#"(?i)"?[_A-Za-z][\w]*"?\."#).unwrap());
+    re.replace_all(s, "").to_string()
+}
+
 // Detects PostgreSQL custom dump format by checking the file header for the
 // custom-format magic bytes (starts with "PGDMP" in ASCII).
 fn is_custom_pg_dump(path: &PathBuf) -> Result<bool, Box<dyn std::error::Error>> {
@@ -600,6 +770,16 @@ fn is_custom_pg_dump(path: &PathBuf) -> Result<bool, Box<dyn std::error::Error>>
     let mut buf = [0u8; 5];
     let n = f.read(&mut buf)?;
     if n < 5 { return Ok(false); }
+    // if file is gzipped, check gzip header first and attempt to read inner header
+    if &buf[..2] == b"\x1f\x8b" {
+        // rewind and try to decode a few bytes from the gzip stream
+        f.rewind()?;
+        let mut gz = GzDecoder::new(f);
+        let mut ibuf = [0u8; 5];
+        let m = gz.read(&mut ibuf)?;
+        if m < 5 { return Ok(false); }
+        return Ok(&ibuf == b"PGDMP");
+    }
     Ok(&buf == b"PGDMP")
 }
 
@@ -610,11 +790,31 @@ fn run_pg_restore(path: &PathBuf) -> Result<String, Box<dyn std::error::Error>> 
     let pg_restore = which::which("pg_restore").map_err(|_| {
         format!("pg_restore not found in PATH; required to extract custom-format PostgreSQL dumps")
     })?;
+    // If the file is gzipped, decompress to a temp file and pass that to pg_restore
+    let mut input_path = path.clone();
+    // keep temp file alive while pg_restore runs to avoid premature deletion
+    let mut _tmpf_opt: Option<NamedTempFile> = None;
+    // quick gz detection
+    let mut probe = std::fs::File::open(path)?;
+    let mut hdr = [0u8;2];
+    let _ = probe.read(&mut hdr)?;
+    if &hdr == b"\x1f\x8b" {
+        // verbose isn't available here; emit a generic hint via stderr
+        eprintln!("detected gzip-compressed dump; decompressing for pg_restore");
+        let mut f = std::fs::File::open(path)?;
+        let mut gz = GzDecoder::new(&mut f);
+        let mut tmpf = NamedTempFile::new()?;
+        std::io::copy(&mut gz, &mut tmpf)?;
+        input_path = tmpf.path().to_path_buf();
+        _tmpf_opt = Some(tmpf);
+    }
+
     let output = Command::new(pg_restore)
-        .arg("--format=custom")
-        .arg("--verbose")
-        .arg("--file=-")
-        .arg(path.as_os_str())
+        .arg("-F")
+        .arg("c")
+        .arg("-f")
+        .arg("-")
+        .arg(input_path.as_os_str())
         .output()?;
     if !output.status.success() {
         return Err(format!("pg_restore failed: {}", String::from_utf8_lossy(&output.stderr)).into());
