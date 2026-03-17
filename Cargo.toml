@@ -1,6 +1,9 @@
 [package]
 name = "pg2lite"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+authors = ["Your Name <you@example.com>"]
+description = "Convert PostgreSQL dump files to SQLite (minimal CLI first step)"
+license = "MIT"
 
 [dependencies]
