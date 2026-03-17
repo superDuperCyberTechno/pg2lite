@@ -1,3 +1,6 @@
 /target
 run.err
 .Trash
+*.sqlite
+.vscode/
+.idea/
