@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use std::fs;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
-use sqlparser::ast::{Statement, ObjectName, Value as SQLValue, Expr};
+use rusqlite::params;
+use sqlparser::ast::{Statement, ObjectName, Value as SQLValue, Expr, TableConstraint, ColumnOption};
 
 /// Convert a PostgreSQL dump file at `input` into a SQLite database at `output`.
 pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -82,6 +83,9 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
     let mut conn = Connection::open(output)?;
     let tx = conn.transaction()?;
 
+    // track tables that should be AUTOINCREMENT primary key: (table_name, pk_column)
+    let mut autoinc_tables: Vec<(String, String)> = Vec::new();
+
     for seg in segments {
         match seg {
             Segment::Stmt(stmt) => {
@@ -96,22 +100,70 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                     Ok(stmts) => {
                         for st in stmts {
                             match st {
-                                Statement::CreateTable { name, columns, .. } => {
+                                Statement::CreateTable { name, columns, constraints, .. } => {
                                     // translate CreateTable into a SQLite-compatible DDL
                                     let tbl_name = name.to_string();
-                                    let mut col_defs: Vec<String> = Vec::new();
-                                    for col in columns {
+                                    // collect column info first so we can apply table-level constraints
+                                    struct ColInfo { name: String, typ: String, not_null: bool, default_nextval: bool, is_primary: bool }
+                                    let mut cols_info: Vec<ColInfo> = Vec::new();
+                                    for col in columns.iter() {
                                         let mut typ = col.data_type.to_string();
-                                        // basic type mappings
                                         if typ.to_uppercase() == "SERIAL" {
                                             typ = "INTEGER".to_string();
                                         }
                                         typ = typ.replace("BYTEA", "BLOB");
                                         typ = typ.replace("BOOLEAN", "INTEGER").replace("boolean", "INTEGER");
-                                        let mut def = format!("{} {}", col.name.to_string(), typ);
-                                        // keep simple: don't try to map constraints here
+                                        let mut not_null = false;
+                                        let mut default_nextval = false;
+                                        let mut is_primary = false;
+                                        for opt in col.options.iter() {
+                                            match &opt.option {
+                                                ColumnOption::NotNull => not_null = true,
+                                                ColumnOption::Default(expr) => {
+                                                    let txt = expr.to_string().to_lowercase();
+                                                    if txt.contains("nextval") {
+                                                        default_nextval = true;
+                                                    }
+                                                }
+                                                ColumnOption::Unique { is_primary: prim } => {
+                                                    if *prim { is_primary = true; }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        cols_info.push(ColInfo { name: col.name.to_string(), typ, not_null, default_nextval, is_primary });
+                                    }
+
+                                    // apply table-level primary key constraints
+                                    for c in constraints.iter() {
+                                        if let TableConstraint::Unique { is_primary, columns, .. } = c {
+                                            if *is_primary {
+                                                for pk in columns {
+                                                    for ci in cols_info.iter_mut() {
+                                                        if ci.name == pk.to_string() {
+                                                            ci.is_primary = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    let mut col_defs: Vec<String> = Vec::new();
+                                    for ci in cols_info.iter() {
+                                        // If column is primary and either declared SERIAL/DEFAULT nextval or type INTEGER,
+                                        // make it INTEGER PRIMARY KEY AUTOINCREMENT for SQLite.
+                                        if ci.is_primary && (ci.default_nextval || ci.typ.to_uppercase() == "INTEGER") {
+                                            let def = format!("{} INTEGER PRIMARY KEY AUTOINCREMENT", ci.name);
+                                            col_defs.push(def);
+                                            autoinc_tables.push((tbl_name.clone(), ci.name.clone()));
+                                            continue;
+                                        }
+                                        let mut def = format!("{} {}", ci.name, ci.typ);
+                                        if ci.not_null { def.push_str(" NOT NULL"); }
                                         col_defs.push(def);
                                     }
+
                                     let create_sql = format!("CREATE TABLE {} ({});", tbl_name, col_defs.join(", "));
                                     if let Err(e) = tx.execute_batch(&create_sql) {
                                         eprintln!("warning: failed to execute CREATE TABLE {}: {}", tbl_name, e);
@@ -243,6 +295,18 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
     }
 
     tx.commit()?;
+
+    // After committing, update sqlite_sequence for AUTOINCREMENT tables so future inserts continue correctly.
+    for (table, pk) in autoinc_tables {
+        let q = format!("SELECT MAX({}) FROM {}", pk, table);
+        if let Ok(max_val) = conn.query_row(q.as_str(), [], |r| r.get::<_, Option<i64>>(0)) {
+            if let Some(maxv) = max_val {
+                // try to write into sqlite_sequence; ignore errors if table isn't present
+                let _ = conn.execute("INSERT OR REPLACE INTO sqlite_sequence(name, seq) VALUES (?1, ?2)", params![table, maxv]);
+            }
+        }
+    }
+
     Ok(())
 }
 
