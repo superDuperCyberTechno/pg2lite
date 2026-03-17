@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+// PathBuf import intentionally unused in this ignored perf test on some CI setups.
+// Keep for clarity of intended temp file types.
 use std::time::Instant;
 
 /// Ignored performance test — generates a large COPY block and runs conversion.
