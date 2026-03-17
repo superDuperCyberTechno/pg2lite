@@ -2,6 +2,9 @@ use regex::Regex;
 use rusqlite::Connection;
 use std::path::PathBuf;
 use std::fs;
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
+use sqlparser::ast::{Statement, ObjectName, Value as SQLValue};
 
 /// Convert a PostgreSQL dump file at `input` into a SQLite database at `output`.
 pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -87,38 +90,100 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                     continue;
                 }
 
-        let s_upper = s.to_uppercase();
-        // Skip unsupported statements
-        if s_upper.starts_with("SET ")
-            || s_upper.starts_with("SELECT PG_CATALOG.SETVAL")
-            || s_upper.starts_with("COPY ")
-            || s_upper.starts_with("ALTER TABLE")
-            || s_upper.starts_with("COMMENT ON")
-            || s_upper.starts_with("CREATE EXTENSION")
-            || s_upper.starts_with("REVOKE ")
-            || s_upper.starts_with("GRANT ")
-        {
-            continue;
-        }
-
-        let mut tstmt = s.to_string();
-
-        if s_upper.starts_with("CREATE TABLE") {
-            // Simplistic transformations for CREATE TABLE
-            tstmt = re_serial.replace_all(&tstmt, "INTEGER").to_string();
-            tstmt = re_nextval.replace_all(&tstmt, "").to_string();
-            tstmt = tstmt.replace("BYTEA", "BLOB");
-            tstmt = tstmt.replace("boolean", "INTEGER");
-            tstmt = tstmt.replace("BOOLEAN", "INTEGER");
-        } else if s_upper.starts_with("INSERT INTO") {
-            // Convert boolean literals and remove E'' escapes
-            tstmt = tstmt.replace("TRUE", "1").replace("FALSE", "0");
-            tstmt = re_e_quote.replace_all(&tstmt, "'").to_string();
-        }
-
-        // Execute statement; continue on error but print a warning so the user can inspect.
-                if let Err(e) = tx.execute_batch(&tstmt) {
-                    eprintln!("warning: failed to execute statement starting with '{}': {}", &tstmt.lines().next().unwrap_or(""), e);
+                // Parse using sqlparser to get reliable ASTs for CREATE TABLE and INSERT
+                let dialect = PostgreSqlDialect {};
+                match Parser::parse_sql(&dialect, s) {
+                    Ok(stmts) => {
+                        for st in stmts {
+                            match st {
+                                Statement::CreateTable { name, columns, .. } => {
+                                    // translate CreateTable into a SQLite-compatible DDL
+                                    let tbl_name = name.to_string();
+                                    let mut col_defs: Vec<String> = Vec::new();
+                                    for col in columns {
+                                        let mut typ = col.data_type.to_string();
+                                        // basic type mappings
+                                        if typ.to_uppercase() == "SERIAL" {
+                                            typ = "INTEGER".to_string();
+                                        }
+                                        typ = typ.replace("BYTEA", "BLOB");
+                                        typ = typ.replace("BOOLEAN", "INTEGER").replace("boolean", "INTEGER");
+                                        let mut def = format!("{} {}", col.name, typ);
+                                        if col.options.iter().any(|o| matches!(o.option, sqlparser::ast::ColumnOption::Unique { is_primary: true } | sqlparser::ast::ColumnOption::Unique { is_primary: false })) {
+                                            // leave as is
+                                        }
+                                        col_defs.push(def);
+                                    }
+                                    let create_sql = format!("CREATE TABLE {} ({});", tbl_name, col_defs.join(", "));
+                                    if let Err(e) = tx.execute_batch(&create_sql) {
+                                        eprintln!("warning: failed to execute CREATE TABLE {}: {}", tbl_name, e);
+                                    }
+                                }
+                                Statement::Insert { table_name, columns, source, .. } => {
+                                    // Build INSERT statement with values from AST
+                                    let tbl = table_name.to_string();
+                                    // extract values from source if it's a Values
+                                    if let sqlparser::ast::SetExpr::Values(values) = *source.body.clone() {
+                                        for row in values.0 {
+                                            let mut vals: Vec<rusqlite::types::Value> = Vec::new();
+                                            for v in row { 
+                                                match v {
+                                                    SQLValue::Number(s, _) => {
+                                                        vals.push(rusqlite::types::Value::from(s));
+                                                    }
+                                                    SQLValue::SingleQuotedString(s) => {
+                                                        vals.push(rusqlite::types::Value::from(s));
+                                                    }
+                                                    SQLValue::Boolean(b) => {
+                                                        vals.push(rusqlite::types::Value::from(if b {1} else {0}));
+                                                    }
+                                                    _ => {
+                                                        vals.push(rusqlite::types::Value::Null);
+                                                    }
+                                                }
+                                            }
+                                            // construct placeholder list
+                                            let placeholders: Vec<&str> = (0..vals.len()).map(|_| "?").collect();
+                                            let sql = format!("INSERT INTO {} ({}) VALUES ({});", tbl, if columns.is_empty() { "" } else { &columns.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ") }, placeholders.join(", "));
+                                            // prepare and execute
+                                            match tx.prepare(&sql) {
+                                                Ok(mut pst) => {
+                                                    let res = pst.execute(rusqlite::params_from_iter(vals.iter()));
+                                                    if let Err(e) = res { eprintln!("warning: failed to insert parsed row into {}: {}", tbl, e); }
+                                                }
+                                                Err(e) => eprintln!("warning: failed to prepare insert for {}: {}", tbl, e),
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    // Fallback: try simple textual transforms for other statements
+                                    let mut tstmt = s.to_string();
+                                    tstmt = re_serial.replace_all(&tstmt, "INTEGER").to_string();
+                                    tstmt = re_nextval.replace_all(&tstmt, "").to_string();
+                                    tstmt = tstmt.replace("BYTEA", "BLOB");
+                                    tstmt = tstmt.replace("boolean", "INTEGER");
+                                    tstmt = tstmt.replace("BOOLEAN", "INTEGER");
+                                    tstmt = re_e_quote.replace_all(&tstmt, "'").to_string();
+                                    if let Err(e) = tx.execute_batch(&tstmt) {
+                                        eprintln!("warning: failed to execute statement: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // parsing failed; fallback to previous behaviour
+                        let mut tstmt = s.to_string();
+                        tstmt = re_serial.replace_all(&tstmt, "INTEGER").to_string();
+                        tstmt = re_nextval.replace_all(&tstmt, "").to_string();
+                        tstmt = tstmt.replace("BYTEA", "BLOB");
+                        tstmt = tstmt.replace("boolean", "INTEGER");
+                        tstmt = tstmt.replace("BOOLEAN", "INTEGER");
+                        if let Err(e2) = tx.execute_batch(&tstmt) {
+                            eprintln!("warning: failed to execute statement after parse error: {} / {}", e, e2);
+                        }
+                    }
                 }
             }
             Segment::Copy { header, rows } => {
@@ -225,7 +290,7 @@ mod tests {
     fn test_unescape_copy_field() {
         assert_eq!(unescape_copy_field("Hello\\nWorld"), "Hello\nWorld");
         assert_eq!(unescape_copy_field("Tab\\tHere"), "Tab\tHere");
-        assert_eq!(unescape_copy_field("Oct\\123"), String::from_utf8(vec![b'O', 0o123]).unwrap_or_default());
+        assert_eq!(unescape_copy_field("Oct\\123"), "OctS");
         assert_eq!(unescape_copy_field("Back\\\\Slash"), "Back\\Slash");
     }
 }
