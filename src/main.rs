@@ -14,10 +14,7 @@ struct Args {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Actually perform the conversion and write the SQLite database.
-    /// If omitted the program will only print the computed output path.
-    #[arg(long)]
-    apply: bool,
+    /// Perform the conversion and write the SQLite database (default)
 }
 
 fn main() {
@@ -34,11 +31,10 @@ fn main() {
     };
     println!("{}", out_path.display());
 
-    if args.apply {
-        if let Err(e) = convert_dump_to_sqlite(&args.input, &out_path) {
-            eprintln!("error: conversion failed: {}", e);
-            process::exit(3);
-        }
+    // Default behavior: perform the conversion and write the SQLite database.
+    if let Err(e) = convert_dump_to_sqlite(&args.input, &out_path) {
+        eprintln!("error: conversion failed: {}", e);
+        process::exit(3);
     }
 }
 
