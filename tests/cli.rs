@@ -9,7 +9,7 @@ fn missing_argument_shows_usage() {
     let mut cmd = Command::cargo_bin("pg2lite").unwrap();
     cmd.assert()
         .failure()
-        .stderr(predicate::str::contains("USAGE"));
+        .stderr(predicate::str::contains("Usage"));
 }
 
 #[test]
