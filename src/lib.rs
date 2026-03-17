@@ -81,6 +81,15 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
         std::fs::create_dir_all(parent)?;
     }
     let mut conn = Connection::open(output)?;
+
+    // Performance: tune SQLite for bulk import. These pragmas speed up large inserts
+    // when creating a new DB from a trusted dump. They reduce durability guarantees
+    // during import but are safe for producing a fresh DB file. We don't aggressively
+    // restore old settings here because the DB is newly created in most cases.
+    let _ = conn.execute_batch(
+        "PRAGMA synchronous = OFF;\nPRAGMA journal_mode = MEMORY;\nPRAGMA temp_store = MEMORY;\n",
+    );
+
     let tx = conn.transaction()?;
 
     // track tables that should be AUTOINCREMENT primary key: (table_name, pk_column)
@@ -181,44 +190,49 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                                     }
                                 }
                                 Statement::Insert { table_name, columns, source, .. } => {
-                                    // Build INSERT statement with values from AST
+                                    // Build INSERT statement with values from AST. Prepare the
+                                    // statement once per INSERT source and reuse it for all rows
+                                    // to avoid repeated parse/prepare overhead.
                                     let tbl = table_name.to_string();
                                     let columns_str = if columns.is_empty() { None } else { Some(columns.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")) };
-                                    // extract values from source if it's a Values
                                     if let sqlparser::ast::SetExpr::Values(values) = *source.body.clone() {
-                                        for row in values.rows {
-                                            let mut vals: Vec<rusqlite::types::Value> = Vec::new();
-                                            for expr in row {
-                                                match expr {
-                                                    Expr::Value(SQLValue::Number(s, _)) => {
-                                                        vals.push(rusqlite::types::Value::from(s));
-                                                    }
-                                                    Expr::Value(SQLValue::SingleQuotedString(s)) => {
-                                                        vals.push(rusqlite::types::Value::from(s));
-                                                    }
-                                                    Expr::Value(SQLValue::Boolean(b)) => {
-                                                        vals.push(rusqlite::types::Value::from(if b {1} else {0}));
-                                                    }
-                                                    Expr::Value(SQLValue::Null) => {
-                                                        vals.push(rusqlite::types::Value::Null);
-                                                    }
-                                                    _ => {
-                                                        vals.push(rusqlite::types::Value::Null);
-                                                    }
-                                                }
-                                            }
-                                            // construct placeholder list
-                                            let placeholders: Vec<&str> = (0..vals.len()).map(|_| "?").collect();
+                                        // construct placeholder list based on first row's length
+                                        if let Some(first_row) = values.rows.get(0) {
+                                            let param_count = first_row.len();
+                                            let placeholders: Vec<&str> = (0..param_count).map(|_| "?").collect();
                                             let sql = if let Some(ref cols) = columns_str {
                                                 format!("INSERT INTO {} ({}) VALUES ({});", tbl, cols, placeholders.join(", "))
                                             } else {
                                                 format!("INSERT INTO {} VALUES ({});", tbl, placeholders.join(", "))
                                             };
-                                            // prepare and execute
+
                                             match tx.prepare(&sql) {
                                                 Ok(mut pst) => {
-                                                    let res = pst.execute(rusqlite::params_from_iter(vals.iter()));
-                                                    if let Err(e) = res { eprintln!("warning: failed to insert parsed row into {}: {}", tbl, e); }
+                                                    for row in values.rows {
+                                                        let mut vals: Vec<rusqlite::types::Value> = Vec::new();
+                                                        for expr in row {
+                                                            match expr {
+                                                                Expr::Value(SQLValue::Number(s, _)) => {
+                                                                    vals.push(rusqlite::types::Value::from(s));
+                                                                }
+                                                                Expr::Value(SQLValue::SingleQuotedString(s)) => {
+                                                                    vals.push(rusqlite::types::Value::from(s));
+                                                                }
+                                                                Expr::Value(SQLValue::Boolean(b)) => {
+                                                                    vals.push(rusqlite::types::Value::from(if b {1} else {0}));
+                                                                }
+                                                                Expr::Value(SQLValue::Null) => {
+                                                                    vals.push(rusqlite::types::Value::Null);
+                                                                }
+                                                                _ => {
+                                                                    vals.push(rusqlite::types::Value::Null);
+                                                                }
+                                                            }
+                                                        }
+                                                        if let Err(e) = pst.execute(rusqlite::params_from_iter(vals.iter())) {
+                                                            eprintln!("warning: failed to insert parsed row into {}: {}", tbl, e);
+                                                        }
+                                                    }
                                                 }
                                                 Err(e) => eprintln!("warning: failed to prepare insert for {}: {}", tbl, e),
                                             }
