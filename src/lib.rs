@@ -150,10 +150,12 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                                     }
 
                                     let mut col_defs: Vec<String> = Vec::new();
+                                    let pk_cols: Vec<String> = cols_info.iter().filter(|c| c.is_primary).map(|c| c.name.clone()).collect();
+                                    let composite_pk = pk_cols.len() > 1;
                                     for ci in cols_info.iter() {
-                                        // If column is primary and either declared SERIAL/DEFAULT nextval or type INTEGER,
+                                        // If single-column primary key and either declared SERIAL/DEFAULT nextval or type INTEGER,
                                         // make it INTEGER PRIMARY KEY AUTOINCREMENT for SQLite.
-                                        if ci.is_primary && (ci.default_nextval || ci.typ.to_uppercase() == "INTEGER") {
+                                        if !composite_pk && ci.is_primary && (ci.default_nextval || ci.typ.to_uppercase() == "INTEGER") {
                                             let def = format!("{} INTEGER PRIMARY KEY AUTOINCREMENT", ci.name);
                                             col_defs.push(def);
                                             autoinc_tables.push((tbl_name.clone(), ci.name.clone()));
@@ -161,7 +163,16 @@ pub fn convert_dump_to_sqlite(input: &PathBuf, output: &PathBuf) -> Result<(), B
                                         }
                                         let mut def = format!("{} {}", ci.name, ci.typ);
                                         if ci.not_null { def.push_str(" NOT NULL"); }
+                                        // Do not add PRIMARY KEY here for composite PKs; will add table-level PK later
+                                        if ci.is_primary && !composite_pk {
+                                            def.push_str(" PRIMARY KEY");
+                                        }
                                         col_defs.push(def);
+                                    }
+                                    // If composite primary key, append table-level PRIMARY KEY clause
+                                    if composite_pk {
+                                        let pk_clause = format!("PRIMARY KEY ({})", pk_cols.join(", "));
+                                        col_defs.push(pk_clause);
                                     }
 
                                     let create_sql = format!("CREATE TABLE {} ({});", tbl_name, col_defs.join(", "));
